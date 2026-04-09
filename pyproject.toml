@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "promotion-gauger"
+version = "0.1.0"
+description = "Real-time promotion sentiment tracking dashboard for retail campaigns."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "pandas>=2.2.2",
+  "plotly>=5.24.1",
+  "praw>=7.8.1",
+  "streamlit>=1.44.0",
+  "vadersentiment>=3.3.2",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

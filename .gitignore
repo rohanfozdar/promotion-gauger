@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.venv/
+.DS_Store
+data/promotion_gauger.db
+*.sqlite3
+src/*.egg-info/
