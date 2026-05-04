@@ -11,7 +11,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
 
-from promotion_gauger.config import PromoMonitor
+from promotion_gauger.config import AppConfig, PromoMonitor
 from promotion_gauger.ingest import collect_google_news_rss, collect_reddit_rss
 from promotion_gauger.pipeline import ingest_mentions, sync_all_feeds_for_monitors
 from promotion_gauger.sentiment import PromotionSentimentScorer
@@ -27,15 +27,31 @@ SENTIMENT_COLORS = {
 }
 
 
-def load_mentions() -> pd.DataFrame:
-    store = MentionStore(DB_PATH)
+@st.cache_resource
+def get_store() -> MentionStore:
+    store = MentionStore(AppConfig().db_path)
     store.initialize()
-    return store.fetch_mentions_dataframe()
+    return store
+
+
+@st.cache_resource
+def get_scorer() -> PromotionSentimentScorer:
+    finetuned_path = Path("models/retail_sentiment")
+    return PromotionSentimentScorer(
+        model_path=finetuned_path if finetuned_path.exists() else None
+    )
+
+
+def load_mentions() -> pd.DataFrame:
+    return get_store().fetch_mentions_dataframe()
 
 
 def sync_live_feeds(store: MentionStore, scorer: PromotionSentimentScorer) -> tuple[bool, str]:
-    sync_all_feeds_for_monitors(store, scorer)
-    return True, "Synced all public feeds for configured monitors."
+    try:
+        sync_all_feeds_for_monitors(store, scorer)
+        return True, "Synced all public feeds for configured monitors."
+    except Exception as exc:
+        return False, f"Feed sync failed: {exc}"
 
 
 def execute_market_search(
@@ -710,13 +726,8 @@ st.set_page_config(
 
 inject_styles()
 
-store = MentionStore(DB_PATH)
-store.initialize()
-finetuned_path = Path("models/retail_sentiment")
-scorer = PromotionSentimentScorer(model_path=finetuned_path if finetuned_path.exists() else None)
-if store.count_mentions() == 0:
-    with st.spinner("First run — seeding initial data..."):
-        sync_all_feeds_for_monitors(store, scorer)
+store = get_store()
+scorer = get_scorer()
 start_scheduler(store, scorer, interval_minutes=30)
 
 if st.sidebar.button("Sync all feeds", width="stretch"):
@@ -777,6 +788,8 @@ elif search_query and st.session_state.get("last_market_consensus_query") == sea
     mentions = load_mentions()
     filtered = mentions[(mentions["promo_name"] == search_query) & (mentions["platform"] != "review")].copy()
 else:
+    if store.count_mentions() == 0:
+        st.info("No data yet — click 'Sync all feeds' in the sidebar to load mentions.")
     st.markdown(
         """
         <div style="text-align:center;padding:4rem 2rem;color:#999">
