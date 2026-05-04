@@ -15,6 +15,7 @@ class MentionRecord:
     timestamp: str
     text: str
     engagement: int
+    source_url: str = ""
 
     @classmethod
     def from_raw(cls, payload: dict) -> "MentionRecord":
@@ -29,6 +30,7 @@ class MentionRecord:
             timestamp=raw_timestamp,
             text=payload["text"],
             engagement=int(payload.get("engagement", 0)),
+            source_url=payload.get("source_url", ""),
         )
 
 
@@ -49,6 +51,7 @@ class MentionStore:
                     timestamp TEXT NOT NULL,
                     text TEXT NOT NULL,
                     engagement INTEGER NOT NULL DEFAULT 0,
+                    source_url TEXT DEFAULT '',
                     overall_sentiment REAL NOT NULL,
                     price_sentiment REAL NOT NULL,
                     brand_sentiment REAL NOT NULL,
@@ -56,6 +59,7 @@ class MentionStore:
                 )
                 """
             )
+            self._ensure_source_url_column(conn)
 
     def upsert_mention(
         self,
@@ -77,11 +81,12 @@ class MentionStore:
                     timestamp,
                     text,
                     engagement,
+                    source_url,
                     overall_sentiment,
                     price_sentiment,
                     brand_sentiment,
                     urgency_sentiment
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(source_id) DO UPDATE SET
                     platform = excluded.platform,
                     promo_name = excluded.promo_name,
@@ -89,6 +94,7 @@ class MentionStore:
                     timestamp = excluded.timestamp,
                     text = excluded.text,
                     engagement = excluded.engagement,
+                    source_url = excluded.source_url,
                     overall_sentiment = excluded.overall_sentiment,
                     price_sentiment = excluded.price_sentiment,
                     brand_sentiment = excluded.brand_sentiment,
@@ -102,6 +108,7 @@ class MentionStore:
                     mention.timestamp,
                     mention.text,
                     mention.engagement,
+                    mention.source_url,
                     overall_sentiment,
                     price_sentiment,
                     brand_sentiment,
@@ -125,3 +132,9 @@ class MentionStore:
 
     def _connect(self) -> sqlite3.Connection:
         return sqlite3.connect(self.db_path)
+
+    @staticmethod
+    def _ensure_source_url_column(conn: sqlite3.Connection) -> None:
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(mentions)").fetchall()}
+        if "source_url" not in columns:
+            conn.execute("ALTER TABLE mentions ADD COLUMN source_url TEXT DEFAULT ''")

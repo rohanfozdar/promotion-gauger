@@ -6,6 +6,11 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from dotenv import load_dotenv
+
+
+load_dotenv()
+
 
 @dataclass(slots=True)
 class AppConfig:
@@ -39,6 +44,7 @@ class PromoMonitor:
     promo_name: str
     keywords: list[str]
     subreddits: list[str]
+    review_categories: list[str] = field(default_factory=list)
     lookback_hours: int = 72
     post_limit: int = 25
     comments_per_post: int = 5
@@ -63,6 +69,7 @@ class PromoMonitor:
             promo_name=payload["promo_name"],
             keywords=list(payload["keywords"]),
             subreddits=list(payload["subreddits"]),
+            review_categories=list(payload.get("review_categories", [])),
             lookback_hours=int(payload.get("lookback_hours", 72)),
             post_limit=int(payload.get("post_limit", 25)),
             comments_per_post=int(payload.get("comments_per_post", 5)),

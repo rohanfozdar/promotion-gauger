@@ -1,7 +1,13 @@
 __pycache__/
 *.pyc
 .venv/
+.venv_py314_bak/
+.env
+.streamlit/secrets.toml
 .DS_Store
+models/
 data/promotion_gauger.db
+data/promotion_gauger.db.broken-*
+data/promotion_gauger.db.*
 *.sqlite3
 src/*.egg-info/

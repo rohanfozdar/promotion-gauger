@@ -2,64 +2,92 @@ from __future__ import annotations
 
 from pathlib import Path
 import sys
+from html import escape
 
 import pandas as pd
-import plotly.express as px
+import plotly.graph_objects as go
 import streamlit as st
+from apscheduler.schedulers.background import BackgroundScheduler
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
 
-from promotion_gauger.pipeline import ensure_sample_data_loaded
-from promotion_gauger.config import AppConfig, RedditCredentials, load_promo_monitors
-from promotion_gauger.pipeline import sync_reddit_for_monitors
+from promotion_gauger.config import PromoMonitor
+from promotion_gauger.ingest import collect_google_news_rss, collect_reddit_rss
+from promotion_gauger.pipeline import ingest_mentions, sync_all_feeds_for_monitors
+from promotion_gauger.sentiment import PromotionSentimentScorer
 from promotion_gauger.storage import MentionStore
 
 
 DB_PATH = Path("data") / "promotion_gauger.db"
 SENTIMENT_COLORS = {
+    "Overall": "#4A5568",
     "Price": "#6E7F5E",
     "Brand": "#A26752",
     "Urgency": "#B89B72",
-}
-PLATFORM_COLORS = {
-    "reddit": "#7A8B67",
-    "x": "#A77964",
-}
-AXIS_LABELS = {
-    "price_sentiment": "Price",
-    "brand_sentiment": "Brand",
-    "urgency_sentiment": "Urgency",
 }
 
 
 def load_mentions() -> pd.DataFrame:
     store = MentionStore(DB_PATH)
     store.initialize()
-    ensure_sample_data_loaded(store)
     return store.fetch_mentions_dataframe()
 
 
-def sync_live_reddit(promo_names: list[str]) -> tuple[bool, str]:
-    config = AppConfig()
-    credentials = RedditCredentials.from_env()
-    if credentials is None:
-        return False, (
-            "Missing Reddit credentials. Set REDDIT_CLIENT_ID, REDDIT_CLIENT_SECRET, and REDDIT_USER_AGENT "
-            "in your shell before syncing."
-        )
+def sync_live_feeds(store: MentionStore, scorer: PromotionSentimentScorer) -> tuple[bool, str]:
+    sync_all_feeds_for_monitors(store, scorer)
+    return True, "Synced all public feeds for configured monitors."
 
-    monitors = [
-        monitor
-        for monitor in load_promo_monitors(config.promo_config_path)
-        if monitor.enabled and (not promo_names or monitor.promo_name in promo_names)
-    ]
-    if not monitors:
-        return False, f"No enabled promo monitors matched the current selection in {config.promo_config_path}."
 
-    store = MentionStore(config.db_path)
-    store.initialize()
-    count = sync_reddit_for_monitors(store, monitors=monitors, credentials=credentials)
-    return True, f"Synced {count} Reddit mentions from {len(monitors)} configured monitor(s)."
+def execute_market_search(
+    search_query: str,
+    store: MentionStore,
+    scorer: PromotionSentimentScorer,
+) -> pd.DataFrame:
+    monitor = PromoMonitor(
+        promo_name=search_query,
+        keywords=[search_query],
+        subreddits=["deals", "frugal", "buyitforlife"],
+        # Do NOT pull Amazon reviews for ad-hoc searches.
+        # They are category-generic and will contaminate non-retail queries.
+        review_categories=[],
+        enabled=True,
+    )
+
+    mentions = []
+    mentions += list(collect_reddit_rss(monitor))
+    mentions += list(collect_google_news_rss(monitor))
+    ingest_mentions(store, mentions, scorer)
+
+    df = store.fetch_mentions_dataframe()
+    return df[(df["promo_name"] == search_query) & (df["platform"] != "review")].copy()
+
+
+def start_scheduler(
+    store: MentionStore,
+    scorer: PromotionSentimentScorer,
+    interval_minutes: int = 30,
+) -> None:
+    """Start background feed sync scheduler. Safe to call multiple times — only starts once."""
+    current_scheduler = st.session_state.get("scheduler")
+    if current_scheduler is not None and not st.session_state.get("scheduler_started"):
+        current_scheduler.shutdown(wait=False)
+        st.session_state.pop("scheduler", None)
+
+    if st.session_state.get("scheduler_started"):
+        return
+
+    scheduler = BackgroundScheduler()
+    scheduler.add_job(
+        func=lambda: sync_all_feeds_for_monitors(store, scorer),
+        trigger="interval",
+        minutes=interval_minutes,
+        id="feed_sync",
+        replace_existing=True,
+    )
+    scheduler.start()
+    st.session_state["scheduler"] = scheduler
+    st.session_state["scheduler_started"] = True
+    st.session_state["scheduler_interval"] = interval_minutes
 
 
 def inject_styles() -> None:
@@ -123,6 +151,18 @@ def inject_styles() -> None:
         .stApp [data-testid="stSidebar"] [data-baseweb="select"],
         .stApp [data-testid="stSidebar"] [data-baseweb="tag"] {
             font-family: "Inter", sans-serif;
+        }
+
+        section[data-testid="stSidebar"] .stButton > button {
+            background-color: #F5F2ED !important;
+            color: #2D2D2D !important;
+            border: 1px solid #D9D4CC !important;
+            border-radius: 6px !important;
+        }
+
+        section[data-testid="stSidebar"] .stButton > button:hover {
+            background-color: #EDE8E0 !important;
+            border-color: #C4BDB4 !important;
         }
 
         .block-container {
@@ -293,6 +333,16 @@ def inject_styles() -> None:
             font-weight: 600;
             letter-spacing: -0.05em;
             margin-bottom: 0.55rem;
+            display: flex;
+            align-items: center;
+            gap: 0.6rem;
+        }
+
+        .metric-dot {
+            width: 0.72rem;
+            height: 0.72rem;
+            border-radius: 999px;
+            flex: 0 0 auto;
         }
 
         .metric-copy {
@@ -372,6 +422,18 @@ def inject_styles() -> None:
             background: rgba(247, 240, 230, 0.9);
         }
 
+        .score-badge {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            padding: 0.32rem 0.62rem;
+            border-radius: 999px;
+            font-size: 0.82rem;
+            font-weight: 600;
+            letter-spacing: 0.02em;
+            border: 1px solid rgba(63, 48, 35, 0.08);
+        }
+
         .feed-text {
             color: var(--text);
             font-size: 1rem;
@@ -448,12 +510,21 @@ def inject_styles() -> None:
     )
 
 
-def metric_card(label: str, value: str, copy: str) -> None:
+def sentiment_state(value: float) -> tuple[str, str]:
+    if value > 0.1:
+        return "#6E7F5E", "rgba(110, 127, 94, 0.16)"
+    if value < -0.1:
+        return "#A26752", "rgba(162, 103, 82, 0.16)"
+    return "#8B8378", "rgba(139, 131, 120, 0.14)"
+
+
+def metric_card(label: str, value: float, copy: str) -> None:
+    dot_color, _ = sentiment_state(value)
     st.markdown(
         f"""
         <div class="metric-card">
             <div class="metric-label">{label}</div>
-            <div class="metric-value">{value}</div>
+            <div class="metric-value"><span class="metric-dot" style="background:{dot_color};"></span>{value:+.2f}</div>
             <div class="metric-copy">{copy}</div>
         </div>
         """,
@@ -462,6 +533,18 @@ def metric_card(label: str, value: str, copy: str) -> None:
 
 
 def render_feed_card(row: pd.Series) -> None:
+    _, badge_background = sentiment_state(float(row["overall_sentiment"]))
+    badge_color, _ = sentiment_state(float(row["overall_sentiment"]))
+    text = str(row["text"])
+    truncated_text = f"{text[:200]}..." if len(text) > 200 else text
+    source_url = str(row.get("source_url", "") or "").strip()
+    source_link = ""
+    if source_url:
+        source_link = (
+            f'<a href="{escape(source_url, quote=True)}" target="_blank" '
+            'style="font-size:0.78rem;color:#6E7F5E;text-decoration:none;">'
+            "↗ View source</a>"
+        )
     axes = [
         ("Price", row["price_sentiment"], SENTIMENT_COLORS["Price"]),
         ("Brand", row["brand_sentiment"], SENTIMENT_COLORS["Brand"]),
@@ -480,13 +563,15 @@ def render_feed_card(row: pd.Series) -> None:
         f"""
         <article class="feed-card">
             <div class="feed-meta">
-                <span class="feed-pill">{row["platform"]}</span>
-                <span class="feed-pill">{row["promo_name"]}</span>
-                <span>@{row["author"]}</span>
+                <span class="feed-pill">{escape(str(row["platform"]).lower())}</span>
+                <span class="feed-pill">↑ {int(row["engagement"])}</span>
+                {source_link}
+                <span class="feed-pill">{escape(str(row["promo_name"]))}</span>
+                <span class="score-badge" style="background:{badge_background}; color:{badge_color};">{row["overall_sentiment"]:+.2f}</span>
+                <span>@{escape(str(row["author"]))}</span>
                 <span>{row["timestamp"].strftime("%b %d, %I:%M %p UTC")}</span>
-                <span>{int(row["engagement"])} engagements</span>
             </div>
-            <p class="feed-text">{row["text"]}</p>
+            <p class="feed-text">{escape(truncated_text)}</p>
             <div class="signal-row">{chips}</div>
         </article>
         """,
@@ -494,70 +579,126 @@ def render_feed_card(row: pd.Series) -> None:
     )
 
 
-def build_timeline_figure(timeline: pd.DataFrame):
-    fig = px.line(
-        timeline,
-        x="hour",
-        y="score",
-        color="axis",
-        color_discrete_map=SENTIMENT_COLORS,
-        markers=True,
-    )
-    fig.update_traces(line=dict(width=3), marker=dict(size=8))
+def build_sentiment_distribution_figure(df: pd.DataFrame):
+    """
+    Horizontal stacked bar showing % positive / neutral / negative
+    for each sentiment axis: Overall, Price, Brand, Urgency.
+    Positive = score > 0.15, Negative = score < -0.15, Neutral = between.
+    """
+    axes = {
+        "Overall": "overall_sentiment",
+        "Price": "price_sentiment",
+        "Brand": "brand_sentiment",
+        "Urgency": "urgency_sentiment",
+    }
+    rows = []
+    for label, col in axes.items():
+        total = max(len(df), 1)
+        pos = (df[col] > 0.15).sum() / total * 100
+        neg = (df[col] < -0.15).sum() / total * 100
+        neu = 100 - pos - neg
+        rows.append({"Axis": label, "Positive": pos, "Neutral": neu, "Negative": neg})
+
+    dist_df = pd.DataFrame(rows)
+    fig = go.Figure()
+    for sentiment, color in [
+        ("Positive", "#6E7F5E"),
+        ("Neutral", "#B89B72"),
+        ("Negative", "#A26752"),
+    ]:
+        fig.add_trace(
+            go.Bar(
+                name=sentiment,
+                x=dist_df[sentiment],
+                y=dist_df["Axis"],
+                orientation="h",
+                marker_color=color,
+                text=dist_df[sentiment].apply(lambda value: f"{value:.0f}%"),
+                textposition="inside",
+            )
+        )
+
     fig.update_layout(
-        paper_bgcolor="rgba(0,0,0,0)",
-        plot_bgcolor="rgba(0,0,0,0)",
-        margin=dict(l=12, r=12, t=14, b=12),
-        legend_title_text="",
-        hovermode="x unified",
-        font=dict(color="#3b3129", family="Inter, sans-serif"),
-    )
-    fig.update_xaxes(
-        title=None,
-        showgrid=False,
-        linecolor="rgba(60, 47, 34, 0.16)",
-        tickfont=dict(color="#6f665c"),
-    )
-    fig.update_yaxes(
-        title=None,
-        showgrid=True,
-        gridcolor="rgba(60, 47, 34, 0.08)",
-        zeroline=True,
-        zerolinecolor="rgba(60, 47, 34, 0.12)",
-        tickfont=dict(color="#6f665c"),
+        barmode="stack",
+        title="Sentiment Breakdown by Axis",
+        font=dict(color="#1A1A1A"),
+        xaxis=dict(
+            title="% of mentions",
+            range=[0, 100],
+            showgrid=False,
+            tickfont=dict(color="#1A1A1A"),
+            title_font=dict(color="#1A1A1A"),
+        ),
+        yaxis=dict(showgrid=False, tickfont=dict(color="#1A1A1A")),
+        plot_bgcolor="#FAF9F6",
+        paper_bgcolor="#FAF9F6",
+        legend=dict(orientation="h", y=-0.2, font=dict(color="#1A1A1A")),
+        margin=dict(l=20, r=20, t=40, b=20),
     )
     return fig
 
 
-def build_volume_figure(volume: pd.DataFrame):
-    fig = px.bar(
-        volume,
-        x="hour",
-        y="size",
-        color="platform",
-        color_discrete_map=PLATFORM_COLORS,
+def build_source_breakdown_figure(df: pd.DataFrame):
+    """
+    Two-panel view:
+    Left: donut chart showing mention count by platform (reddit / news / review)
+    Right: horizontal bar showing average overall_sentiment per platform
+    Rendered as two Plotly subplots side by side.
+    """
+    from plotly.subplots import make_subplots
+
+    platform_counts = df["platform"].value_counts().reset_index()
+    platform_counts.columns = ["platform", "count"]
+    platform_sentiment = df.groupby("platform")["overall_sentiment"].mean().reset_index()
+
+    color_map = {"reddit": "#6E7F5E", "news": "#B89B72", "review": "#A26752"}
+    fig = make_subplots(
+        rows=1,
+        cols=2,
+        specs=[[{"type": "domain"}, {"type": "xy"}]],
+        subplot_titles=["Mentions by Source", "Avg Sentiment by Source"],
+    )
+    fig.add_trace(
+        go.Pie(
+            labels=platform_counts["platform"],
+            values=platform_counts["count"],
+            hole=0.5,
+            marker_colors=[color_map.get(platform, "#999") for platform in platform_counts["platform"]],
+            textinfo="label+percent",
+        ),
+        row=1,
+        col=1,
+    )
+    fig.add_trace(
+        go.Bar(
+            x=platform_sentiment["overall_sentiment"],
+            y=platform_sentiment["platform"],
+            orientation="h",
+            marker_color=[color_map.get(platform, "#999") for platform in platform_sentiment["platform"]],
+            text=platform_sentiment["overall_sentiment"].apply(lambda value: f"{value:+.2f}"),
+            textposition="outside",
+        ),
+        row=1,
+        col=2,
     )
     fig.update_layout(
-        paper_bgcolor="rgba(0,0,0,0)",
-        plot_bgcolor="rgba(0,0,0,0)",
-        margin=dict(l=12, r=12, t=14, b=12),
-        legend_title_text="",
-        hovermode="x unified",
-        font=dict(color="#3b3129", family="Inter, sans-serif"),
-        bargap=0.28,
+        font=dict(color="#1A1A1A"),
+        plot_bgcolor="#FAF9F6",
+        paper_bgcolor="#FAF9F6",
+        showlegend=False,
+        margin=dict(l=20, r=20, t=40, b=20),
+        xaxis=dict(
+            range=[-1, 1],
+            zeroline=True,
+            zerolinecolor="#ddd",
+            showgrid=False,
+            tickfont=dict(color="#1A1A1A"),
+            title_font=dict(color="#1A1A1A"),
+        ),
+        yaxis=dict(showgrid=False, tickfont=dict(color="#1A1A1A")),
     )
-    fig.update_xaxes(
-        title=None,
-        showgrid=False,
-        linecolor="rgba(60, 47, 34, 0.16)",
-        tickfont=dict(color="#6f665c"),
-    )
-    fig.update_yaxes(
-        title=None,
-        showgrid=True,
-        gridcolor="rgba(60, 47, 34, 0.08)",
-        tickfont=dict(color="#6f665c"),
-    )
+    for annotation in fig.layout.annotations:
+        annotation.font.color = "#1A1A1A"
     return fig
 
 
@@ -569,97 +710,47 @@ st.set_page_config(
 
 inject_styles()
 
-mentions = load_mentions()
+store = MentionStore(DB_PATH)
+store.initialize()
+finetuned_path = Path("models/retail_sentiment")
+scorer = PromotionSentimentScorer(model_path=finetuned_path if finetuned_path.exists() else None)
+if store.count_mentions() == 0:
+    with st.spinner("First run — seeding initial data..."):
+        sync_all_feeds_for_monitors(store, scorer)
+start_scheduler(store, scorer, interval_minutes=30)
 
-if mentions.empty:
-    st.warning("No mentions are available yet. Seed sample data or connect a live source.")
-    st.stop()
-
-mentions["timestamp"] = pd.to_datetime(mentions["timestamp"], utc=True)
-mentions["hour"] = mentions["timestamp"].dt.floor("h")
-mentions["platform"] = mentions["platform"].str.upper().replace({"X": "X", "REDDIT": "REDDIT"})
-
-st.sidebar.markdown("### Monitoring Lens")
-st.sidebar.caption("Shape the view without losing the editorial feel of the main canvas.")
-
-platforms = sorted(mentions["platform"].dropna().unique().tolist())
-selected_platforms = st.sidebar.multiselect(
-    "Platform",
-    options=platforms,
-    default=platforms,
-)
-
-promo_names = sorted(mentions["promo_name"].dropna().unique().tolist())
-selected_promos = st.sidebar.multiselect(
-    "Promotion",
-    options=promo_names,
-    default=promo_names,
-)
-
-config = AppConfig()
-configured_monitors = load_promo_monitors(config.promo_config_path)
-configured_names = [monitor.promo_name for monitor in configured_monitors if monitor.enabled]
-
-st.sidebar.markdown("### Live sync")
-st.sidebar.caption("Use your configured Reddit monitors to pull fresh mentions into the local store.")
-st.sidebar.markdown(
-    f"Configured monitors: **{len(configured_names)}**  \n"
-    f"Active campaigns: **{', '.join(configured_names) if configured_names else 'None'}**"
-)
-if st.sidebar.button("Sync Reddit now", width="stretch"):
+if st.sidebar.button("Sync all feeds", width="stretch"):
     with st.sidebar:
-        with st.spinner("Pulling fresh Reddit mentions..."):
-            ok, message = sync_live_reddit(selected_promos)
+        with st.spinner("Pulling fresh public feed mentions..."):
+            ok, message = sync_live_feeds(store, scorer)
     if ok:
         st.sidebar.success(message)
         st.rerun()
     else:
         st.sidebar.error(message)
 
-filtered = mentions[
-    mentions["platform"].isin(selected_platforms)
-    & mentions["promo_name"].isin(selected_promos)
-].copy()
-
-if filtered.empty:
-    st.markdown('<p class="section-label">No active view</p>', unsafe_allow_html=True)
-    st.info("No mentions match the active filters.")
-    st.stop()
-
-selected_promo_text = ", ".join(selected_promos[:2]) if selected_promos else "All campaigns"
-if len(selected_promos) > 2:
-    selected_promo_text += f" +{len(selected_promos) - 2} more"
-latest_window = filtered["timestamp"].max() - filtered["timestamp"].min()
-avg_sentiment = filtered[
-    ["price_sentiment", "brand_sentiment", "urgency_sentiment"]
-].mean().mean()
-top_platform = filtered["platform"].mode().iat[0]
+if st.session_state.get("scheduler_started"):
+    interval = st.session_state.get("scheduler_interval", 30)
+    st.sidebar.caption(f"Auto-sync every {interval} min")
 
 st.markdown(
-    f"""
+    """
     <section class="hero-shell">
         <div class="hero-grid">
             <div>
-                <span class="eyebrow"><span class="pulse-dot"></span>Live promotion monitoring</span>
+                <span class="eyebrow"><span class="pulse-dot"></span>Market consensus tracking</span>
                 <h1 class="hero-title">Promotion Gauger</h1>
                 <p class="hero-copy">
-                    Read the emotional temperature of a promotion before the revenue curve catches up.
-                    This view turns scattered social chatter into a calm operating surface for pricing,
-                    brand, and urgency response.
+                    Search a promotion, product, or offer and pull a live read from Reddit, news,
+                    and retail reviews before the revenue curve catches up.
                 </p>
-                <div class="chip-row">
-                    <span class="chip">Campaigns: {selected_promo_text}</span>
-                    <span class="chip">Platforms: {', '.join(selected_platforms)}</span>
-                    <span class="chip">Lead platform: {top_platform}</span>
-                </div>
             </div>
             <div class="hero-panel">
-                <p class="hero-panel-label">Current read</p>
-                <p class="hero-panel-value">{avg_sentiment:+.2f}</p>
+                <p class="hero-panel-label">Search mode</p>
+                <p class="hero-panel-value">Live</p>
                 <p class="hero-panel-copy">
-                    Average signal across the three sentiment lenses over an observed window of
-                    {str(latest_window).split('.')[0]}. Use this as an early read on whether a
-                    campaign feels compelling, trustworthy, and time-sensitive.
+                    Each search builds a temporary monitor and scores fresh mentions with the
+                    retail-tuned sentiment model.
                 </p>
             </div>
         </div>
@@ -668,28 +759,77 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+st.markdown("### What promotion do you want to track?")
+search_query = st.text_input(
+    label="",
+    placeholder="e.g. Nike Air Max sale, whey protein discount, summer running gear...",
+    label_visibility="collapsed",
+    key="market_consensus_query",
+)
+run_search = st.button("Get Market Consensus", type="primary")
+search_query = search_query.strip()
+
+if run_search and search_query:
+    with st.spinner("Pulling data from Reddit, News, and Reviews..."):
+        filtered = execute_market_search(search_query, store, scorer)
+    st.session_state["last_market_consensus_query"] = search_query
+elif search_query and st.session_state.get("last_market_consensus_query") == search_query:
+    mentions = load_mentions()
+    filtered = mentions[(mentions["promo_name"] == search_query) & (mentions["platform"] != "review")].copy()
+else:
+    st.markdown(
+        """
+        <div style="text-align:center;padding:4rem 2rem;color:#999">
+            <div style="font-size:3rem;margin-bottom:1rem">🔍</div>
+            <div style="font-size:1.1rem">Enter a promotion above to see what the market thinks</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    st.stop()
+
+if len(filtered) == 0:
+    st.warning(
+        f"No mentions found for '{search_query}'. Try broader keywords — e.g. "
+        "'Jaguar EV rebrand' instead of 'Jaguar electric vehicle promotion'."
+    )
+    st.stop()
+
+filtered["timestamp"] = pd.to_datetime(filtered["timestamp"], utc=True, format="mixed")
+filtered["platform"] = filtered["platform"].astype(str).str.lower()
+
+overall_mean = filtered["overall_sentiment"].mean()
+if overall_mean > 0.15:
+    consensus_label = "Positive"
+    consensus_color = "#6E7F5E"
+elif overall_mean < -0.15:
+    consensus_label = "Negative"
+    consensus_color = "#A26752"
+else:
+    consensus_label = "Mixed"
+    consensus_color = "#B89B72"
+
+st.markdown(
+    f"""
+    <div style="padding:1.5rem;border-radius:8px;background:{consensus_color}18;border-left:4px solid {consensus_color};margin-bottom:1.5rem">
+        <div style="font-size:0.85rem;color:#666;margin-bottom:0.25rem">Market Consensus — {len(filtered)} sources analyzed</div>
+        <div style="font-size:2rem;font-weight:700;color:{consensus_color}">{consensus_label}</div>
+        <div style="font-size:0.9rem;color:#444;margin-top:0.25rem">Overall sentiment score: {overall_mean:+.2f}</div>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
+
 st.markdown('<p class="section-label">Executive snapshot</p>', unsafe_allow_html=True)
 metric_cols = st.columns(4)
 with metric_cols[0]:
-    metric_card("Mentions captured", f"{len(filtered):,}", "Active conversation volume across the selected monitoring window.")
+    metric_card("Overall sentiment", float(filtered["overall_sentiment"].mean()), "The blended emotional read across all captured conversation.")
 with metric_cols[1]:
-    metric_card("Price sentiment", f"{filtered['price_sentiment'].mean():+.2f}", "How credible and valuable the offer feels in the market.")
+    metric_card("Price sentiment", float(filtered["price_sentiment"].mean()), "How credible and valuable the offer feels in the market.")
 with metric_cols[2]:
-    metric_card("Brand sentiment", f"{filtered['brand_sentiment'].mean():+.2f}", "Whether the promotion strengthens trust or creates skepticism.")
+    metric_card("Brand sentiment", float(filtered["brand_sentiment"].mean()), "Whether the promotion strengthens trust or creates skepticism.")
 with metric_cols[3]:
-    metric_card("Urgency sentiment", f"{filtered['urgency_sentiment'].mean():+.2f}", "Whether shoppers feel compelled to act now rather than wait.")
-
-timeline = (
-    filtered.groupby("hour", as_index=False)[
-        ["price_sentiment", "brand_sentiment", "urgency_sentiment"]
-    ]
-    .mean()
-    .melt(id_vars="hour", var_name="axis", value_name="score")
-)
-timeline["axis"] = timeline["axis"].map(AXIS_LABELS).fillna(timeline["axis"])
-
-volume = filtered.groupby(["hour", "platform"], as_index=False).size()
-volume["platform"] = volume["platform"].str.lower()
+    metric_card("Urgency sentiment", float(filtered["urgency_sentiment"].mean()), "Whether shoppers feel compelled to act now rather than wait.")
 
 left_col, right_col = st.columns([1.35, 1], gap="large")
 with left_col:
@@ -698,15 +838,15 @@ with left_col:
         <section class="panel">
             <div class="panel-heading">
                 <div>
-                    <p class="panel-title">Sentiment over time</p>
-                    <p class="panel-copy">Track how the tone of the promotion moves across price, brand, and urgency as conversation evolves.</p>
+                    <p class="panel-title">Sentiment distribution</p>
+                    <p class="panel-copy">See how mentions split into positive, neutral, and negative reads across each sentiment axis.</p>
                 </div>
-                <span class="panel-kicker">Signal trend</span>
+                <span class="panel-kicker">Axis mix</span>
             </div>
         """,
         unsafe_allow_html=True,
     )
-    st.plotly_chart(build_timeline_figure(timeline), width="stretch")
+    st.plotly_chart(build_sentiment_distribution_figure(filtered), width="stretch")
     st.markdown("</section>", unsafe_allow_html=True)
 
 with right_col:
@@ -715,19 +855,15 @@ with right_col:
         <section class="panel">
             <div class="panel-heading">
                 <div>
-                    <p class="panel-title">Conversation volume</p>
-                    <p class="panel-copy">Watch where discussion is clustering so spikes in chatter stand out before downstream performance does.</p>
+                    <p class="panel-title">Source breakdown</p>
+                    <p class="panel-copy">Compare where mentions came from and how each source type is leaning on overall sentiment.</p>
                 </div>
-                <span class="panel-kicker">Channel mix</span>
+                <span class="panel-kicker">Source mix</span>
             </div>
         """,
         unsafe_allow_html=True,
     )
-    st.plotly_chart(build_volume_figure(volume), width="stretch")
-    st.markdown(
-        '<p class="operator-note">The strongest platform in this view is highlighted through calmer earth-toned bars instead of default dashboard colors.</p>',
-        unsafe_allow_html=True,
-    )
+    st.plotly_chart(build_source_breakdown_figure(filtered), width="stretch")
     st.markdown("</section>", unsafe_allow_html=True)
 
 st.markdown(
@@ -755,9 +891,11 @@ with st.expander("Operator table view"):
             "platform",
             "author",
             "promo_name",
+            "overall_sentiment",
             "price_sentiment",
             "brand_sentiment",
             "urgency_sentiment",
+            "source_url",
             "text",
         ]
     ].copy()

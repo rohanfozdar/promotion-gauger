@@ -1,0 +1,15 @@
+accelerate>=0.27.0
+apscheduler>=3.10.0
+datasets>=2.18.0,<4.0.0
+feedparser>=6.0.0
+pandas>=2.2.2
+plotly>=5.24.1
+praw>=7.8.1
+python-dotenv>=1.0.1
+requests>=2.31.0
+scikit-learn>=1.4.0
+scipy>=1.12.0
+streamlit>=1.44.0
+torch>=2.0.0
+transformers>=4.38.0
+vadersentiment>=3.3.2
